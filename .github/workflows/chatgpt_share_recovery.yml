@@ -1,0 +1,115 @@
+name: ChatGPT share recovery
+
+on:
+  push:
+    branches:
+      - chatgpt-share-recovery-20260904
+  workflow_dispatch:
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch and split shared conversation
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, urllib.request
+          from pathlib import Path
+
+          share_id = "6a9b0077-ac80-83ea-a172-872bc7629f84"
+          url = f"https://chatgpt.com/backend-api/share/{share_id}"
+          req = urllib.request.Request(url, headers={
+              "User-Agent": "Mozilla/5.0",
+              "Accept": "application/json,text/plain,*/*",
+          })
+          with urllib.request.urlopen(req, timeout=120) as r:
+              raw = r.read()
+
+          out = Path("recovered")
+          out.mkdir(exist_ok=True)
+          (out / "raw_share.json").write_bytes(raw)
+          root = json.loads(raw)
+
+          def find_linear(x):
+              stack=[x]
+              seen=set()
+              while stack:
+                  v=stack.pop()
+                  if id(v) in seen: continue
+                  seen.add(id(v))
+                  if isinstance(v, dict):
+                      c=v.get("linear_conversation")
+                      if isinstance(c, list): return c
+                      stack.extend(v.values())
+                  elif isinstance(v, list):
+                      stack.extend(v)
+              return None
+
+          conv = find_linear(root)
+          if conv is None:
+              raise SystemExit("linear_conversation not found")
+
+          msgs=[]
+          for pos,node in enumerate(conv):
+              if not isinstance(node,dict): continue
+              m=node.get("message")
+              if not isinstance(m,dict): continue
+              a=m.get("author") or {}
+              role=a.get("role") if isinstance(a,dict) else None
+              if role not in {"user","assistant"}: continue
+              if (m.get("recipient") or "all") != "all": continue
+              c=m.get("content") or {}
+              parts=c.get("parts") if isinstance(c,dict) else None
+              text=""
+              if isinstance(parts,list):
+                  text="\n".join(p for p in parts if isinstance(p,str)).strip()
+              if not text: continue
+              msgs.append({"index":len(msgs),"source_position":pos,"id":m.get("id"),"role":role,"create_time":m.get("create_time"),"text":text})
+
+          if not msgs:
+              raise SystemExit("no user/assistant messages found")
+
+          (out / "messages.json").write_text(json.dumps(msgs,ensure_ascii=False,indent=2),encoding="utf-8")
+          first=next(m for m in msgs if m["role"]=="user")
+          (out / "first_user_message.txt").write_text(first["text"],encoding="utf-8")
+
+          blocks=[]
+          outline=["# Conversation Outline",""]
+          for m in msgs:
+              label=m["role"].upper()
+              blocks.append(f"## Turn {m['index']+1} — {label}\n\n{m['text'].rstrip()}\n")
+              preview=re.sub(r"\s+"," ",m["text"]).strip()
+              if len(preview)>180: preview=preview[:177]+"..."
+              outline.append(f"- **Turn {m['index']+1} — {m['role'].title()}** ({len(m['text']):,} chars): {preview}")
+          full="\n".join(blocks)
+          (out / "conversation.md").write_text(full,encoding="utf-8")
+          (out / "outline.md").write_text("\n".join(outline)+"\n",encoding="utf-8")
+
+          chunkdir=out / "chunks"
+          chunkdir.mkdir(exist_ok=True)
+          target=120_000
+          cur=[]; size=0; chunk_no=1
+          for m in msgs:
+              b=f"## Turn {m['index']+1} — {m['role'].upper()}\n\n{m['text'].rstrip()}\n\n"
+              if cur and size+len(b)>target:
+                  (chunkdir/f"part_{chunk_no:03d}.md").write_text("".join(cur),encoding="utf-8")
+                  chunk_no+=1; cur=[]; size=0
+              cur.append(b); size+=len(b)
+          if cur:
+              (chunkdir/f"part_{chunk_no:03d}.md").write_text("".join(cur),encoding="utf-8")
+
+          print(f"RECOVERED_MESSAGES={len(msgs)}")
+          print(f"FIRST_USER_CHARS={len(first['text'])}")
+          print(f"TOTAL_TEXT_CHARS={sum(len(m['text']) for m in msgs)}")
+          print(f"CHUNKS={chunk_no}")
+          PY
+
+      - name: Upload recovered conversation
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-share-recovered
+          path: recovered/
+          retention-days: 1
