@@ -12,102 +12,158 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Fetch and split shared conversation
+      - name: Fetch public share page by multiple routes
         shell: bash
         run: |
+          set +e
+          mkdir -p recovered
+          SHARE='https://chatgpt.com/share/6a9b0077-ac80-83ea-a172-872bc7629f84'
+          JINA='https://r.jina.ai/https://chatgpt.com/share/6a9b0077-ac80-83ea-a172-872bc7629f84'
+
+          echo '=== direct curl ===' | tee recovered/diagnostics.txt
+          curl -L --compressed -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+            -sS -D recovered/direct_headers.txt -o recovered/direct_share.html \
+            -w 'status=%{http_code} size=%{size_download} final=%{url_effective}\n' "$SHARE" \
+            | tee -a recovered/diagnostics.txt
+          wc -c recovered/direct_share.html 2>/dev/null | tee -a recovered/diagnostics.txt
+          grep -o 'streamController.enqueue' recovered/direct_share.html 2>/dev/null | wc -l | sed 's/^/turbo_enqueue_count=/' | tee -a recovered/diagnostics.txt
+
+          echo '=== jina reader ===' | tee -a recovered/diagnostics.txt
+          curl -L --compressed -A 'Mozilla/5.0' -sS -D recovered/jina_headers.txt \
+            -o recovered/jina_share.txt -w 'status=%{http_code} size=%{size_download}\n' "$JINA" \
+            | tee -a recovered/diagnostics.txt
+          wc -c recovered/jina_share.txt 2>/dev/null | tee -a recovered/diagnostics.txt
+          head -c 500 recovered/jina_share.txt 2>/dev/null > recovered/jina_head.txt
+
           python - <<'PY'
-          import json, re, urllib.request
+          import json, re
           from pathlib import Path
 
-          share_id = "6a9b0077-ac80-83ea-a172-872bc7629f84"
-          url = f"https://chatgpt.com/backend-api/share/{share_id}"
-          req = urllib.request.Request(url, headers={
-              "User-Agent": "Mozilla/5.0",
-              "Accept": "application/json,text/plain,*/*",
-          })
-          with urllib.request.urlopen(req, timeout=120) as r:
-              raw = r.read()
+          out = Path('recovered')
+          html_path = out/'direct_share.html'
+          if not html_path.exists():
+              print('NO_DIRECT_HTML')
+              raise SystemExit(0)
+          html = html_path.read_text(encoding='utf-8', errors='replace')
+          print('DIRECT_HTML_CHARS', len(html))
 
-          out = Path("recovered")
-          out.mkdir(exist_ok=True)
-          (out / "raw_share.json").write_bytes(raw)
-          root = json.loads(raw)
+          encoded = re.findall(r'streamController\.enqueue\(("(?:\\.|[^"\\])*")\)', html, flags=re.S)
+          print('ENCODED_CHUNKS', len(encoded))
+          if not encoded:
+              print('NO_TURBO_STREAM_FOUND')
+              raise SystemExit(0)
+
+          try:
+              stream_text = ''.join(json.loads(s) for s in encoded)
+              (out/'turbo_stream.txt').write_text(stream_text, encoding='utf-8')
+              first_line = stream_text.split('\n',1)[0]
+              table = json.loads(first_line)
+              print('TABLE_TYPE', type(table).__name__, 'TABLE_LEN', len(table) if isinstance(table,list) else -1)
+          except Exception as e:
+              print('TURBO_DECODE_ERROR', repr(e))
+              raise SystemExit(0)
+
+          SENT={-1:None,-2:None,-3:None,-4:None,-5:None,-6:False,-7:True}
+          memo={}
+          def resolve(v):
+              if not isinstance(v,int): return v
+              if v<0: return SENT.get(v)
+              if v in memo: return memo[v]
+              if not isinstance(table,list) or v>=len(table): return v
+              raw=table[v]
+              if isinstance(raw,dict):
+                  obj={}; memo[v]=obj
+                  for k,item in raw.items():
+                      key=k
+                      if isinstance(k,str) and k.startswith('_') and k[1:].isdigit():
+                          key=resolve(int(k[1:]))
+                      obj[key]=resolve(item)
+                  return obj
+              if isinstance(raw,list):
+                  if raw and raw[0]=='P': memo[v]=None; return None
+                  arr=[]; memo[v]=arr; arr.extend(resolve(x) for x in raw); return arr
+              memo[v]=raw; return raw
+
+          try:
+              root=resolve(0)
+          except Exception as e:
+              print('RESOLVE_ERROR', repr(e))
+              raise SystemExit(0)
 
           def find_linear(x):
-              stack=[x]
-              seen=set()
+              stack=[x]; seen=set()
               while stack:
-                  v=stack.pop()
-                  if id(v) in seen: continue
-                  seen.add(id(v))
-                  if isinstance(v, dict):
-                      c=v.get("linear_conversation")
-                      if isinstance(c, list): return c
+                  v=stack.pop(); oid=id(v)
+                  if oid in seen: continue
+                  seen.add(oid)
+                  if isinstance(v,dict):
+                      c=v.get('linear_conversation')
+                      if isinstance(c,list): return c
                       stack.extend(v.values())
-                  elif isinstance(v, list):
-                      stack.extend(v)
+                  elif isinstance(v,list): stack.extend(v)
               return None
 
-          conv = find_linear(root)
-          if conv is None:
-              raise SystemExit("linear_conversation not found")
+          conv=find_linear(root)
+          print('LINEAR_FOUND', bool(conv), 'LEN', len(conv) if conv else 0)
+          if not conv: raise SystemExit(0)
+
+          def text_from_content(c):
+              if not isinstance(c,dict): return ''
+              parts=c.get('parts')
+              if isinstance(parts,list):
+                  vals=[]
+                  for p in parts:
+                      if isinstance(p,str): vals.append(p)
+                      elif isinstance(p,dict) and isinstance(p.get('text'),str): vals.append(p['text'])
+                  return '\n'.join(vals).strip()
+              for key in ('text','result','output'):
+                  if isinstance(c.get(key),str): return c[key].strip()
+              return ''
 
           msgs=[]
           for pos,node in enumerate(conv):
               if not isinstance(node,dict): continue
-              m=node.get("message")
+              m=node.get('message')
               if not isinstance(m,dict): continue
-              a=m.get("author") or {}
-              role=a.get("role") if isinstance(a,dict) else None
-              if role not in {"user","assistant"}: continue
-              if (m.get("recipient") or "all") != "all": continue
-              c=m.get("content") or {}
-              parts=c.get("parts") if isinstance(c,dict) else None
-              text=""
-              if isinstance(parts,list):
-                  text="\n".join(p for p in parts if isinstance(p,str)).strip()
+              a=m.get('author') or {}
+              role=a.get('role') if isinstance(a,dict) else None
+              if role not in {'user','assistant'}: continue
+              if (m.get('recipient') or 'all')!='all': continue
+              text=text_from_content(m.get('content') or {})
               if not text: continue
-              msgs.append({"index":len(msgs),"source_position":pos,"id":m.get("id"),"role":role,"create_time":m.get("create_time"),"text":text})
+              msgs.append({'index':len(msgs),'source_position':pos,'id':m.get('id'),'role':role,'create_time':m.get('create_time'),'text':text})
 
-          if not msgs:
-              raise SystemExit("no user/assistant messages found")
+          print('RECOVERED_MESSAGES', len(msgs))
+          if not msgs: raise SystemExit(0)
+          (out/'messages.json').write_text(json.dumps(msgs,ensure_ascii=False,indent=2),encoding='utf-8')
+          first=next((m for m in msgs if m['role']=='user'),None)
+          if first:
+              (out/'first_user_message.txt').write_text(first['text'],encoding='utf-8')
+              print('FIRST_USER_CHARS',len(first['text']))
 
-          (out / "messages.json").write_text(json.dumps(msgs,ensure_ascii=False,indent=2),encoding="utf-8")
-          first=next(m for m in msgs if m["role"]=="user")
-          (out / "first_user_message.txt").write_text(first["text"],encoding="utf-8")
-
-          blocks=[]
-          outline=["# Conversation Outline",""]
+          blocks=[]; outline=['# Conversation Outline','']
           for m in msgs:
-              label=m["role"].upper()
-              blocks.append(f"## Turn {m['index']+1} — {label}\n\n{m['text'].rstrip()}\n")
-              preview=re.sub(r"\s+"," ",m["text"]).strip()
-              if len(preview)>180: preview=preview[:177]+"..."
+              blocks.append(f"## Turn {m['index']+1} — {m['role'].upper()}\n\n{m['text'].rstrip()}\n")
+              preview=re.sub(r'\s+',' ',m['text']).strip()
+              if len(preview)>180: preview=preview[:177]+'...'
               outline.append(f"- **Turn {m['index']+1} — {m['role'].title()}** ({len(m['text']):,} chars): {preview}")
-          full="\n".join(blocks)
-          (out / "conversation.md").write_text(full,encoding="utf-8")
-          (out / "outline.md").write_text("\n".join(outline)+"\n",encoding="utf-8")
+          (out/'conversation.md').write_text('\n'.join(blocks),encoding='utf-8')
+          (out/'outline.md').write_text('\n'.join(outline)+'\n',encoding='utf-8')
 
-          chunkdir=out / "chunks"
-          chunkdir.mkdir(exist_ok=True)
-          target=120_000
-          cur=[]; size=0; chunk_no=1
+          cdir=out/'chunks'; cdir.mkdir(exist_ok=True)
+          target=120000; cur=[]; size=0; n=1
           for m in msgs:
               b=f"## Turn {m['index']+1} — {m['role'].upper()}\n\n{m['text'].rstrip()}\n\n"
               if cur and size+len(b)>target:
-                  (chunkdir/f"part_{chunk_no:03d}.md").write_text("".join(cur),encoding="utf-8")
-                  chunk_no+=1; cur=[]; size=0
+                  (cdir/f'part_{n:03d}.md').write_text(''.join(cur),encoding='utf-8'); n+=1; cur=[]; size=0
               cur.append(b); size+=len(b)
-          if cur:
-              (chunkdir/f"part_{chunk_no:03d}.md").write_text("".join(cur),encoding="utf-8")
-
-          print(f"RECOVERED_MESSAGES={len(msgs)}")
-          print(f"FIRST_USER_CHARS={len(first['text'])}")
-          print(f"TOTAL_TEXT_CHARS={sum(len(m['text']) for m in msgs)}")
-          print(f"CHUNKS={chunk_no}")
+          if cur: (cdir/f'part_{n:03d}.md').write_text(''.join(cur),encoding='utf-8')
+          print('CHUNKS',n,'TOTAL_TEXT_CHARS',sum(len(m['text']) for m in msgs))
           PY
 
-      - name: Upload recovered conversation
+      - name: Upload recovery diagnostics and outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: chatgpt-share-recovered
